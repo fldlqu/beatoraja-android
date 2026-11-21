@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="beatoraja_background">#0E1015</color>
+    <color name="beatoraja_surface">#171A21</color>
+    <color name="beatoraja_surface_high">#20242D</color>
+    <color name="beatoraja_surface_highest">#2A2F3A</color>
+    <color name="beatoraja_primary">#A8C7FA</color>
+    <color name="beatoraja_on_primary">#0B1220</color>
+    <color name="beatoraja_secondary">#82D5C6</color>
+    <color name="beatoraja_on_surface">#E6EAF2</color>
+    <color name="beatoraja_on_surface_variant">#A7AEBB</color>
+    <color name="beatoraja_outline">#2C3140</color>
+    <color name="beatoraja_error">#FFB4AB</color>
+    <color name="ic_launcher_background">#101827</color>
+</resources>

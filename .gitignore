@@ -1,0 +1,26 @@
+# Gradle / Android build outputs
+/build/
+/.gradle/
+/.kotlin/
+/local.properties
+*.apk
+*.aab
+
+# Local runtime data and verification captures
+/screenshots/
+/songdata.db
+/songinfo.db
+/config.json
+/config_sys.json
+/practice/
+/screenshot/
+/table/
+/course/
+/favorite/
+/player/
+
+# User-supplied skins are not part of the Android artifact
+/skin/
+/ir/
+
+*.cim

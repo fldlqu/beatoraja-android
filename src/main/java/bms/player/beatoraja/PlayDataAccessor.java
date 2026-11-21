@@ -1,0 +1,782 @@
+package bms.player.beatoraja;
+
+import bms.player.beatoraja.AppPaths;
+
+import java.nio.charset.StandardCharsets;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.security.MessageDigest;
+import java.sql.SQLException;
+import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.stream.Stream;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+
+import bms.model.BMSModel;
+import bms.model.Mode;
+import bms.model.TimeLine;
+import static bms.player.beatoraja.ClearType.*;
+import static bms.player.beatoraja.CourseData.CourseDataConstraint.*;
+
+import bms.player.beatoraja.CourseData.CourseDataConstraint;
+import bms.player.beatoraja.ScoreData.SongTrophy;
+import bms.player.beatoraja.ScoreDatabaseAccessor.ScoreDataCollector;
+import bms.player.beatoraja.ScoreLogDatabaseAccessor.ScoreLog;
+import bms.player.beatoraja.play.BMSPlayerRule;
+import bms.player.beatoraja.play.SecondaryScoringRule;
+import bms.player.beatoraja.song.SongData;
+
+import com.badlogic.gdx.utils.Json;
+import com.badlogic.gdx.utils.JsonWriter.OutputType;
+
+/**
+ * プレイデータアクセス用クラス
+ * 
+ * @author exch
+ */
+public final class PlayDataAccessor {
+
+	// TODO スコアハッシュを付与するかどうかの判定(前のスコアハッシュの正当性を確認できなかった時)
+	// TODO BATTLEは別ハッシュで登録したい}			
+
+	/**
+	 * プレイヤー名
+	 */
+	private final String player;
+	/**
+	 * プレイヤーデータのルートパス
+	 */
+	private final String playerpath;
+	/**
+	 * スコアデータベースアクセサ
+	 */
+	private ScoreDatabaseAccessor scoredb;
+	/**
+	 * スコアログアクセサ
+	 */
+	private ScoreLogDatabaseAccessor scorelogdb;
+	/**
+	 * スコアデータログアクセサ
+	 */
+	private ScoreDataLogDatabaseAccessor scoredatalogdb;
+	private final Map<SecondaryScoringRule, RuleScoreStore> ruleScores = new EnumMap<>(SecondaryScoringRule.class);
+
+
+	private static final String[] replay = { "", "C", "H" };
+
+	public PlayDataAccessor(Config config) {
+		this.player = config.getPlayername();
+		this.playerpath = config.getPlayerpath();
+
+		scoredb = new ScoreDatabaseAccessor(playerpath + File.separatorChar + player + File.separatorChar + "score.db");
+		scoredb.createTable();
+		scorelogdb = new ScoreLogDatabaseAccessor(playerpath + File.separatorChar + player + File.separatorChar + "scorelog.db");
+		scoredatalogdb = new ScoreDataLogDatabaseAccessor(playerpath + File.separatorChar + player + File.separatorChar + "scoredatalog.db");
+
+	}
+
+	public enum ScoreOutcome { FINISHED, FAILED, INTERRUPTED, INPUT_LOST, ERROR }
+
+	/** One rule's actual judgments, not an aggregate personal best. */
+	public record ScoreAttempt(String sha256, int mode, ScoreOutcome outcome, int notes, int passed,
+			int combo, int minbp, ClearType clear, int gauge, float gaugeValue, List<Integer> judgeCounts) {
+		public ScoreAttempt {
+			Objects.requireNonNull(outcome);
+			Objects.requireNonNull(clear);
+			judgeCounts = List.copyOf(judgeCounts);
+			if (sha256 == null || sha256.length() != 64 || mode < 0 || mode > 2 || judgeCounts.size() != 12) {
+				throw new IllegalArgumentException("Invalid score identity or judgment counts");
+			}
+		}
+
+		public int exscore() {
+			return (judgeCounts.get(0) + judgeCounts.get(1)) * 2 + judgeCounts.get(2) + judgeCounts.get(3);
+		}
+
+		public ScoreData toScoreData(Mode playMode) {
+			var score = new ScoreData(playMode);
+			score.setSha256(sha256);
+			score.setMode(mode);
+			score.setNotes(notes);
+			score.setPassnotes(passed);
+			score.setCombo(combo);
+			score.setMinbp(minbp);
+			score.setClear(clear.id);
+			score.setGauge(gauge);
+			for (int i = 0; i < 6; i++) {
+				score.addJudgeCount(i, true, judgeCounts.get(i * 2));
+				score.addJudgeCount(i, false, judgeCounts.get(i * 2 + 1));
+			}
+			return score;
+		}
+
+		boolean canUpdateBest() {
+			return outcome == ScoreOutcome.FINISHED || outcome == ScoreOutcome.FAILED;
+		}
+	}
+
+	private synchronized RuleScoreStore getRuleScores(SecondaryScoringRule rule, boolean create) throws SQLException {
+		var store = ruleScores.get(rule);
+		if (store != null) return store;
+		var profile = AppPaths.path(playerpath, player);
+		var legacy = rule == SecondaryScoringRule.LR2 ? profile.resolve("score-lunaticrave2.db") : null;
+		String suffix = rule.databaseSuffix();
+		if (!create && (legacy == null || !Files.exists(legacy)) && !Files.exists(profile.resolve("score" + suffix + ".db"))) return null;
+		store = new RuleScoreStore(profile, suffix);
+		if (legacy != null) store.importLegacyLr2(legacy);
+		ruleScores.put(rule, store);
+		return store;
+	}
+
+	/** Read a local LR2 best without falling back to a beatoraja score. Mode is the effective LN key. */
+	public ScoreData readLunaticRave2Best(String sha256, int mode) {
+		return readRuleBest(SecondaryScoringRule.LR2, sha256, mode);
+	}
+
+	public ScoreData readRuleBest(SecondaryScoringRule rule, String sha256, int mode) {
+		try {
+			var scores = getRuleScores(rule, false);
+			var best = scores == null ? null : scores.readBest(sha256, mode);
+			if (best != null) best.setRule(rule.scoreRule());
+			return best;
+		} catch (SQLException e) {
+			Logger.getGlobal().log(Level.WARNING, "Could not read local score for " + rule.id(), e);
+			return null;
+		}
+	}
+
+	public void writeLunaticRave2Attempt(ScoreAttempt attempt, boolean scoreAllowed) {
+		writeRuleAttempt(SecondaryScoringRule.LR2, attempt, scoreAllowed);
+	}
+
+	public void writeRuleAttempt(SecondaryScoringRule rule, ScoreAttempt attempt, boolean scoreAllowed) {
+		try {
+			getRuleScores(rule, true).write(attempt, scoreAllowed);
+		} catch (SQLException e) {
+			Logger.getGlobal().log(Level.WARNING, "Could not save local score for " + rule.id(), e);
+		}
+	}
+
+	public PlayerData readPlayerData() {
+		return scoredb.getPlayerData();
+	}
+
+	public PlayerData readTodayPlayerData() {
+		PlayerData[] pd = scoredb.getPlayerDatas(2);
+		if (pd.length > 1) {
+			pd[0].setPlaycount(pd[0].getPlaycount() - pd[1].getPlaycount());
+			pd[0].setClear(pd[0].getClear() - pd[1].getClear());
+			pd[0].setEpg(pd[0].getEpg() - pd[1].getEpg());
+			pd[0].setLpg(pd[0].getLpg() - pd[1].getLpg());
+			pd[0].setEgr(pd[0].getEgr() - pd[1].getEgr());
+			pd[0].setLgr(pd[0].getLgr() - pd[1].getLgr());
+			pd[0].setEgd(pd[0].getEgd() - pd[1].getEgd());
+			pd[0].setLgd(pd[0].getLgd() - pd[1].getLgd());
+			pd[0].setEbd(pd[0].getEbd() - pd[1].getEbd());
+			pd[0].setLbd(pd[0].getLbd() - pd[1].getLbd());
+			pd[0].setEpr(pd[0].getEpr() - pd[1].getEpr());
+			pd[0].setLpr(pd[0].getLpr() - pd[1].getLpr());
+			pd[0].setEms(pd[0].getEms() - pd[1].getEms());
+			pd[0].setLms(pd[0].getLms() - pd[1].getLms());
+			pd[0].setPlaytime(pd[0].getPlaytime() - pd[1].getPlaytime());
+			return pd[0];
+		} else if (pd.length == 1) {
+			return pd[0];
+		}
+		return null;
+	}
+
+	/**
+	 * 指定されたスコアデータを元にプレイヤーデータを更新する
+	 * 
+	 * @param score スコアデータ
+	 * @param time プレイ時間
+	 */
+	public void updatePlayerData(ScoreData score, long time) {
+		PlayerData pd = readPlayerData();
+		pd.setEpg(pd.getEpg() + score.getEpg());
+		pd.setLpg(pd.getLpg() + score.getLpg());
+		pd.setEgr(pd.getEgr() + score.getEgr());
+		pd.setLgr(pd.getLgr() + score.getLgr());
+		pd.setEgd(pd.getEgd() + score.getEgd());
+		pd.setLgd(pd.getLgd() + score.getLgd());
+		pd.setEbd(pd.getEbd() + score.getEbd());
+		pd.setLbd(pd.getLbd() + score.getLbd());
+		pd.setEpr(pd.getEpr() + score.getEpr());
+		pd.setLpr(pd.getLpr() + score.getLpr());
+		pd.setEms(pd.getEms() + score.getEms());
+		pd.setLms(pd.getLms() + score.getLms());
+
+		pd.setPlaycount(pd.getPlaycount() + 1);
+		if (score.getClear() > Failed.id) {
+			pd.setClear(pd.getClear() + 1);
+		}
+		pd.setPlaytime(pd.getPlaytime() + time);
+		scoredb.setPlayerData(pd);
+	}
+
+	/**
+	 * スコアデータを読み込む
+	 * 
+	 * @param model
+	 *            対象のモデル
+	 * @param lnmode
+	 *            LNモード
+	 * @return スコアデータ
+	 */
+	public ScoreData readScoreData(BMSModel model, int lnmode) {
+		String hash = model.getSHA256();
+		boolean ln = model.containsUndefinedLongNote();
+		return readScoreData(hash, ln, lnmode);
+	}
+
+	/**
+	 * スコアデータを読み込む
+	 *
+	 * @param hash
+	 *            楽曲のハッシュ値
+	 * @param ln
+	 *            対象のbmsが未定義LNを含む場合はtrueを入れる
+	 * @param lnmode
+	 *            LNモード
+	 * @return スコアデータ
+	 */
+	public ScoreData readScoreData(String hash, boolean ln, int lnmode) {
+		return scoredb.getScoreData(hash, ln ? lnmode : 0);
+	}
+
+	int getLastPlayedLnMode(String sha256, int fallback) {
+		return scoredb != null ? scoredb.getLastPlayedLnMode(sha256, fallback) : fallback;
+	}
+
+	/**
+	 * スコアデータをまとめて読み込み、collectorに渡す
+	 * @param collector スコアデータのcollector
+	 * @param songs 楽曲データ
+	 * @param lnmode LNモード
+	 */
+	public void readScoreDatas(ScoreDataCollector collector, SongData[] songs, int lnmode) {
+		scoredb.getScoreDatas(collector, songs, lnmode);
+	}
+
+	public List<ScoreData> readScoreDatas(String sql) {
+		return scoredb.getScoreDatas(sql);
+	}
+
+	/**
+	 * スコアデータを書き込む
+	 * 
+	 * @param newscore
+	 *            スコアデータ
+	 * @param model
+	 *            対象のモデル
+	 * @param lnmode
+	 *            LNモード
+	 * @param updateScore
+	 *            プレイ回数のみ反映する場合はfalse
+	 */
+	public void writeScoreData(ScoreData newscore, BMSModel model, int lnmode, boolean updateScore) {
+		String hash = model.getSHA256();
+		if (newscore == null) {
+			return;
+		}
+		ScoreData score = scoredb.getScoreData(hash, model.containsUndefinedLongNote() ? lnmode : 0);
+
+		if (score == null) {
+			score = new ScoreData();
+			score.setMode(model.containsUndefinedLongNote() ? lnmode : 0);
+		}
+		score.setSha256(hash);
+		if (updateScore) {
+			score.setNotes(model.getTotalNotes());
+		}
+
+		if (newscore.getClear() > Failed.id) {
+			score.setClearcount(score.getClearcount() + 1);
+		}
+
+		ScoreLog log = updateScore(score, newscore, hash, updateScore);
+		
+		Set<SongTrophy> l = new HashSet<SongTrophy>();
+		for(char c : score.getTrophy() != null ? score.getTrophy().toCharArray() : new char[0]) {
+			SongTrophy trophy = SongTrophy.getTrophy(c);
+			if(trophy != null) {
+				l.add(trophy);
+			}
+		}
+
+		Set<SongTrophy> newTrophies = new HashSet<SongTrophy>();
+		// クリアトロフィー
+		int clear = newscore.getClear();
+		if(newscore.getGauge() != -1) {			
+			if(clear >= Hard.id){
+				if(clear == ExHard.id) {
+					newTrophies.add(SongTrophy.EXHARD);
+				}
+				newTrophies.add(SongTrophy.HARD);
+			} else {
+				if(clear >= Normal.id) {
+					newTrophies.add(SongTrophy.GROOVE);
+				}
+				newTrophies.add(SongTrophy.EASY);
+			}
+		}
+			
+		// オプショントロフィー
+		// TODO FLIPの扱いは？
+		final SongTrophy[] optionTrophy = {SongTrophy.NORMAL,SongTrophy.MIRROR,SongTrophy.RANDOM, SongTrophy.R_RANDOM
+				,SongTrophy.S_RANDOM, SongTrophy.SPIRAL, SongTrophy.H_RANDOM, SongTrophy.ALL_SCR, SongTrophy.EX_RANDOM
+				,SongTrophy.EX_S_RANDOM};
+			
+		if(clear >= Easy.id) {
+			newTrophies.add(optionTrophy[Math.max(newscore.getOption() % 10, (newscore.getOption() / 10) % 10)]);
+		}
+
+		// newscore のトロフィーをマージ
+		l.addAll(newTrophies);
+		
+		StringBuilder sb = new StringBuilder();
+		for(SongTrophy trophy : l) {
+			sb.append(trophy.character);
+		}
+		score.setTrophy(sb.toString());
+
+		score.setPlaycount(score.getPlaycount() + 1);
+		score.setDate(Calendar.getInstance(TimeZone.getDefault()).getTimeInMillis() / 1000L);
+		score.setScorehash(getScoreHash(score));
+		scoredb.setScoreData(score);
+		if (log.getSha256() != null && scorelogdb != null) {
+			log.setMode(score.getMode());
+			log.setDate(score.getDate());
+			scorelogdb.setScoreLog(log);
+		}
+
+		if (scoredatalogdb != null) {
+			StringBuilder newScoresb = new StringBuilder();
+			for(SongTrophy trophy : newTrophies) {
+				newScoresb.append(trophy.character);
+			}
+			newscore.setTrophy(newScoresb.toString());
+			newscore.setMode(score.getMode());
+			newscore.setDate(score.getDate());
+			newscore.setPlaycount(score.getPlaycount());
+			newscore.setClearcount(score.getClearcount());
+			newscore.setScorehash(getScoreHash(newscore));
+
+			scoredatalogdb.setScoreDataLog(newscore);
+		}
+
+		// 楽曲のプレイ時間算出(秒)
+		long time = 0;
+		for (TimeLine tl : model.getAllTimeLines()) {
+			for (int i = 0; i < model.getMode().key; i++) {
+				if (tl.getNote(i) != null && tl.getNote(i).getState() != 0) {
+					time = tl.getMicroTime() / 1000000;
+				}
+			}
+		}
+		updatePlayerData(newscore, time);
+		Logger.getGlobal().info("スコアデータベース更新完了 ");
+	}
+	
+	public ScoreData readScoreData(String hash, boolean ln, int lnmode, int option,
+			CourseData.CourseDataConstraint[] constraint) {
+		int hispeed = 0;
+		int judge = 0;
+		int gauge = 0;
+		for (CourseData.CourseDataConstraint c : constraint) {
+			switch(c) {
+				case NO_SPEED -> hispeed = 1;
+				case NO_GOOD -> judge = 1;
+				case NO_GREAT -> judge = 2;
+				case GAUGE_LR2 -> gauge = 1;
+				case GAUGE_5KEYS -> gauge = 2;
+				case GAUGE_7KEYS -> gauge = 3;
+				case GAUGE_9KEYS -> gauge = 4;
+				case GAUGE_24KEYS -> gauge = 5;
+			}
+		}
+		return scoredb.getScoreData(hash, (ln ? lnmode : 0) + option * 10 + hispeed * 100 + judge * 1000 + gauge * 10000);
+	}
+
+	public ScoreData readScoreData(BMSModel[] models, int lnmode, int option,
+			CourseData.CourseDataConstraint[] constraint) {
+		String[] hash = new String[models.length];
+		boolean ln = false;
+		for (int i = 0; i < models.length; i++) {
+			hash[i] = models[i].getSHA256();
+			ln |= models[i].containsUndefinedLongNote();
+		}
+		return readScoreData(hash, ln, lnmode, option, constraint);
+	}
+
+	public ScoreData readScoreData(String[] hashes, boolean ln, int lnmode, int option,
+			CourseData.CourseDataConstraint[] constraint) {
+		String hash = "";
+		for (String s : hashes) {
+			hash += s;
+		}
+		return readScoreData(hash, ln, lnmode, option, constraint);
+	}
+
+	/**
+	 * コーススコアデータを書き込む
+	 */
+	public void writeScoreData(ScoreData newscore, BMSModel[] models, int lnmode, int option,
+			CourseData.CourseDataConstraint[] constraint, boolean updateScore) {
+		String hash = "";
+		int totalnotes = 0;
+		boolean ln = false;
+		for (BMSModel model : models) {
+			hash += model.getSHA256();
+			totalnotes += model.getTotalNotes();
+			ln |= model.containsUndefinedLongNote();
+		}
+		if (newscore == null) {
+			return;
+		}
+		int hispeed = 0;
+		int judge = 0;
+		int gauge = 0;
+		for (CourseData.CourseDataConstraint c : constraint) {
+			switch(c) {
+				case NO_SPEED -> hispeed = 1;
+				case NO_GOOD -> judge = 1;
+				case NO_GREAT -> judge = 2;
+				case GAUGE_LR2 -> gauge = 1;
+				case GAUGE_5KEYS -> gauge = 2;
+				case GAUGE_7KEYS -> gauge = 3;
+				case GAUGE_9KEYS -> gauge = 4;
+				case GAUGE_24KEYS -> gauge = 5;
+			}
+		}
+		ScoreData score = scoredb.getScoreData(hash, (ln ? lnmode : 0) + option * 10 + hispeed * 100 + judge * 1000 + gauge * 10000);
+
+		if (score == null) {
+			score = new ScoreData();
+			score.setMode((ln ? lnmode : 0) + option * 10 + hispeed * 100 + judge * 1000 + gauge * 10000);
+		}
+		score.setSha256(hash);
+		score.setNotes(totalnotes);
+
+		if (newscore.getClear() != Failed.id) {
+			score.setClearcount(score.getClearcount() + 1);
+		}
+		
+		ScoreLog log = updateScore(score, newscore, hash, updateScore);
+
+		score.setPlaycount(score.getPlaycount() + 1);
+		score.setDate(Calendar.getInstance(TimeZone.getDefault()).getTimeInMillis() / 1000L);
+		score.setScorehash(getScoreHash(score));
+		scoredb.setScoreData(score);
+		if (log.getSha256() != null && scorelogdb != null) {
+			log.setMode(score.getMode());
+			log.setDate(score.getDate());
+			scorelogdb.setScoreLog(log);
+		}
+
+		Logger.getGlobal().info("スコアデータベース更新完了 ");
+
+	}
+
+	static String getScoreHash(ScoreData score) {
+		byte[] cipher_byte;
+		try {
+			MessageDigest md = MessageDigest.getInstance("SHA-256");
+			md.update((score.getSha256() + "," + score.getExscore() + "," + score.getEpg() + ","
+					+ score.getLpg() + "," + score.getEgr() + "," + score.getLgr() + "," + score.getEgd() + ","
+					+ score.getLgd() + "," + score.getEbd() + "," + score.getLbd() + "," + score.getEpr() + ","
+					+ score.getLpr() + "," + score.getEms() + "," + score.getLms() + "," + score.getClear() + ","
+					+ score.getMinbp() + "," + score.getCombo() + "," + score.getMode() + "," + score.getClearcount()
+					+ "," + score.getPlaycount() + "," + score.getOption() + "," + score.getRandom() + ","
+					+ score.getTrophy() + "," + score.getDate()).getBytes());
+			cipher_byte = md.digest();
+			StringBuilder sb = new StringBuilder(2 * cipher_byte.length);
+			for (byte b : cipher_byte) {
+				sb.append(String.format("%02x", b & 0xff));
+			}
+			return "035" + sb.toString();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+		return null;
+	}
+
+	static ScoreLog updateScore(ScoreData score, ScoreData newscore, String hash, boolean updateScore) {
+		ScoreLog log = new ScoreLog();
+		
+		log.setOldclear(score.getClear());
+		log.setClear(score.getClear());
+		if (score.getClear() < newscore.getClear()) {
+			log.setSha256(hash);
+			log.setClear(newscore.getClear());
+		}
+		log.setOldscore(score.getExscore());
+		log.setScore(score.getExscore());
+		if (score.getExscore() < newscore.getExscore() && updateScore) {
+			log.setSha256(hash);
+			log.setScore(newscore.getExscore());
+		}
+		log.setOldminbp(score.getMinbp());
+		log.setMinbp(score.getMinbp());
+		if (score.getMinbp() > newscore.getMinbp() && updateScore) {
+			log.setSha256(hash);
+			log.setMinbp(newscore.getMinbp());
+		}
+		log.setOldavgjudge(score.getAvgjudge());
+		log.setAvgjudge(score.getAvgjudge());
+		if (score.getAvgjudge() > newscore.getAvgjudge() && updateScore) {
+			log.setSha256(hash);
+			log.setAvgjudge(newscore.getAvgjudge());
+		}
+		log.setOldcombo(score.getCombo());
+		log.setCombo(score.getCombo());
+		if (score.getCombo() < newscore.getCombo() && updateScore) {
+			log.setSha256(hash);
+			log.setCombo(newscore.getCombo());
+		}
+		
+		score.update(newscore, updateScore);
+
+		return log;
+	}
+
+	public void deleteScoreData(BMSModel model, int lnmode) {
+		scoredb.deleteScoreData(model.getSHA256(), model.containsUndefinedLongNote() ? lnmode : 0);
+	}
+
+	public boolean existsReplayData(BMSModel model, int lnmode, int index) {
+		boolean ln = model.containsUndefinedLongNote();
+		return Files.exists(AppPaths.path(this.getReplayDataFilePath(model.getSHA256(), ln, lnmode, index) + ".brd"));
+	}
+
+	public boolean existsReplayData(String hash, boolean ln, int lnmode, int index) {
+		return Files.exists(AppPaths.path(this.getReplayDataFilePath(hash, ln, lnmode, index) + ".brd"));
+	}
+
+	public boolean existsReplayData(BMSModel[] models, int lnmode, int index,
+			CourseData.CourseDataConstraint[] constraint) {
+		String[] hash = new String[models.length];
+		boolean ln = false;
+		for (int i = 0; i < models.length; i++) {
+			BMSModel model = models[i];
+			hash[i] = model.getSHA256();
+			ln |= model.containsUndefinedLongNote();
+		}
+		return Files.exists(AppPaths.path(this.getReplayDataFilePath(hash, ln, lnmode, index, constraint) + ".brd"));
+	}
+
+	public boolean existsReplayData(String[] hash, boolean ln, int lnmode, int index,
+			CourseData.CourseDataConstraint[] constraint) {
+		return Files.exists(AppPaths.path(this.getReplayDataFilePath(hash, ln, lnmode, index, constraint) + ".brd"));
+	}
+
+	/**
+	 * リプレイデータを読み込む
+	 * 
+	 * @param model
+	 *            対象のBMS
+	 * @param lnmode
+	 *            LNモード
+	 * @return リプレイデータ
+	 */
+	public ReplayData readReplayData(BMSModel model, int lnmode, int index) {
+		if (existsReplayData(model, lnmode, index)) {
+			String path = this.getReplayDataFilePath(model, lnmode, index);
+			Path replayPath = AppPaths.path(path + ".brd");
+			ReplayData result = readReplayFile(replayPath, ReplayData.class);
+			if(isValidReplay(result, replayPath)) {
+				return result;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Reads a compressed replay without allowing malformed local replay data to
+	 * interrupt selection or play startup.
+	 */
+	static <T> T readReplayFile(Path path, Class<T> type) {
+		Json json = new Json();
+		json.setIgnoreUnknownFields(true);
+		try (InputStream input = new BufferedInputStream(new GZIPInputStream(Files.newInputStream(path)))) {
+			return json.fromJson(type, input);
+		} catch (IOException | RuntimeException e) {
+			Logger.getGlobal().warning("リプレイデータ読み込み失敗 : " + path + " : " + e.getMessage());
+			return null;
+		}
+	}
+
+	private static boolean isValidReplay(ReplayData replay, Path path) {
+		if (replay == null) {
+			return false;
+		}
+		try {
+			return replay.validate();
+		} catch (RuntimeException e) {
+			Logger.getGlobal().warning("リプレイデータ検証失敗 : " + path + " : " + e.getMessage());
+			return false;
+		}
+	}
+
+	/**
+	 * リプレイデータを書き込む
+	 * 
+	 * @param rd
+	 *            リプレイデータ
+	 * @param model
+	 *            対象のBMS
+	 * @param lnmode
+	 *            LNモード
+	 */
+	public boolean wrireReplayData(ReplayData rd, BMSModel model, int lnmode, int index) {
+		File replaydir = AppPaths.file(this.getReplayDataFolder());
+		if (!replaydir.exists()) {
+			replaydir.mkdirs();
+		}
+		Json json = new Json();
+		json.setOutputType(OutputType.json);
+		try {
+			String path = this.getReplayDataFilePath(model, lnmode, index) + ".brd";
+			rd.shrink();
+			try (var writer = new OutputStreamWriter(
+					new BufferedOutputStream(new GZIPOutputStream(new FileOutputStream(path))), StandardCharsets.UTF_8)) {
+				writer.write(json.prettyPrint(rd));
+			}
+			return true;
+		} catch (IOException e) {
+			e.printStackTrace();
+			return false;
+		}
+
+	}
+
+	public ReplayData[] readReplayData(BMSModel[] models, int lnmode, int index,
+			CourseData.CourseDataConstraint[] constraint) {
+		String[] hashes = new String[models.length];
+		boolean ln = false;
+		for (int i = 0; i < models.length; i++) {
+			hashes[i] = models[i].getSHA256();
+			ln |= models[i].containsUndefinedLongNote();
+		}
+		return this.readReplayData(hashes, ln, lnmode, index, constraint);
+	}
+
+	/**
+	 * コースリプレイデータを読み込む
+	 * 
+	 * @param hash
+	 *            対象のBMSハッシュ群
+	 * @param lnmode
+	 *            LNモード
+	 * @return リプレイデータ
+	 */
+	public ReplayData[] readReplayData(String[] hash, boolean ln, int lnmode, int index,
+			CourseData.CourseDataConstraint[] constraint) {
+		if (existsReplayData(hash, ln, lnmode, index, constraint)) {
+			String path = this.getReplayDataFilePath(hash, ln, lnmode, index, constraint);
+			Path replayPath = AppPaths.path(path + ".brd");
+			ReplayData[] result = readReplayFile(replayPath, ReplayData[].class);
+			if(result != null) {
+				for(ReplayData rd : result) {
+					if(!isValidReplay(rd, replayPath)) {
+						return null;
+					}
+				}
+				return result;
+			}
+		}
+		return null;
+	}
+
+	public boolean wrireReplayData(ReplayData[] rd, BMSModel[] models, int lnmode, int index,
+			CourseData.CourseDataConstraint[] constraint) {
+		String[] hashes = new String[models.length];
+		boolean ln = false;
+		for (int i = 0; i < models.length; i++) {
+			hashes[i] = models[i].getSHA256();
+			ln |= models[i].containsUndefinedLongNote();
+		}
+		return this.wrireReplayData(rd, hashes, ln, lnmode, index, constraint);
+
+	}
+
+	/**
+	 * コースリプレイデータを書き込む
+	 * 
+	 * @param rd
+	 *            リプレイデータ
+	 * @param hash
+	 *            対象のBMSハッシュ群
+	 * @param lnmode
+	 *            LNモード
+	 */
+	public boolean wrireReplayData(ReplayData[] rd, String[] hash, boolean ln, int lnmode, int index,
+			CourseData.CourseDataConstraint[] constraint) {
+		Json json = new Json();
+		json.setOutputType(OutputType.json);
+		try {
+			String path = this.getReplayDataFilePath(hash, ln, lnmode, index, constraint) + ".brd";
+			Stream.of(rd).forEach(ReplayData::shrink);
+			try (var writer = new OutputStreamWriter(
+					new BufferedOutputStream(new GZIPOutputStream(new FileOutputStream(path))), StandardCharsets.UTF_8)) {
+				writer.write(json.prettyPrint(rd));
+			}
+			Logger.getGlobal().info("コースリプレイを保存:" + path);
+			return true;
+		} catch (IOException e) {
+			e.printStackTrace();
+			return false;
+		}
+	}
+
+	public void deleteReplayData(BMSModel model, int lnmode, int index) {
+		if (existsReplayData(model, lnmode, index)) {
+			try {
+				Files.deleteIfExists(AppPaths.path(this.getReplayDataFilePath(model, lnmode, index) + ".brd"));
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+		}
+	}
+
+	private String getReplayDataFilePath(BMSModel model, int lnmode, int index) {
+		return getReplayDataFilePath(model.getSHA256(), model.containsUndefinedLongNote(), lnmode, index);
+	}
+
+	private String getReplayDataFilePath(String hash, boolean ln, int lnmode, int index) {
+		return this.getReplayDataFolder() + File.separatorChar
+				+ (ln ? replay[lnmode] : "") + hash + (index > 0 ? "_" + index : "");
+	}
+
+	private String getReplayDataFilePath(String[] hashes, boolean ln, int lnmode, int index,
+			CourseData.CourseDataConstraint[] constraint) {
+		StringBuilder hash = new StringBuilder();
+		for (String s : hashes) {
+			hash.append(s.substring(0, 10));
+		}
+		StringBuilder sb = new StringBuilder();
+		for (CourseData.CourseDataConstraint c : constraint) {
+			if (c != CLASS && c != MIRROR && c != RANDOM) {
+				for(int i = 0;i < CourseDataConstraint.values().length;i++) {
+					if(c == CourseDataConstraint.values()[i]) {
+						sb.append(String.format("%02d", i + 1));
+						break;
+					}
+				}
+			}
+		}
+		return this.getReplayDataFolder() + File.separatorChar
+				+ (ln ? replay[lnmode] : "") + hash + (sb.length() > 0 ? "_" + sb.toString() : "")
+				+ (index > 0 ? "_" + index : "");
+	}
+
+	private String getReplayDataFolder() {
+		return playerpath + File.separatorChar + player + File.separatorChar + "replay";
+	}
+}

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <attr name="beatorajaButtonTonalStyle" format="reference" />
+    <attr name="beatorajaButtonOutlinedStyle" format="reference" />
+    <attr name="beatorajaButtonTextStyle" format="reference" />
+</resources>
